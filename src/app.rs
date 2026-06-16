@@ -2199,7 +2199,7 @@ impl App {
         fs::remove_file(&self.pipe.logs_out)?;
         fs::remove_file(&self.pipe.history_out)?;
 
-        fs::remove_dir(&self.pipe.path)?;
+        let _ = fs::remove_dir(&self.pipe.path);
         Ok(())
     }
 
