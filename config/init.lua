@@ -434,6 +434,10 @@ do
     col.style = { fg = col_fg[i], bg = "Blue" }
   end
 
+  -- Index column: rename header to "int" and cap its width at 4 chars.
+  g.table.header.cols[1].format = " int"
+  g.table.col_widths[1] = { Max = 4 }
+
   -- The default `perm` renderer paints each r/w/x bit with an ANSI reset that
   -- drops the background to black. Render it as plain text; color comes from the
   -- column style set above.
@@ -471,6 +475,12 @@ do
       r = r .. xplr.util.paint(s, ms)
     end
     return r
+  end
+
+  -- Index column: show only the absolute index, dropping the default's
+  -- relative-to-focus number (the "-1│", "0│", … prefix).
+  xplr.fn.builtin.fmt_general_table_row_cols_0 = function(m)
+    return " " .. m.index
   end
 end
 
