@@ -737,6 +737,9 @@ pub struct UI<'lua> {
     pub lua: &'lua Lua,
     pub screen_size: TuiRect,
     pub scrolltop: usize,
+    /// Inner rect (x, y, w, h) + path of an image-preview panel for this frame,
+    /// to be overlaid by the runner after the frame is flushed. None if no image.
+    pub pending_image: Option<(u16, u16, u16, u16, String)>,
 }
 
 impl<'lua> UI<'lua> {
@@ -747,6 +750,7 @@ impl<'lua> UI<'lua> {
             lua,
             scrolltop,
             screen_size,
+            pending_image: None,
         }
     }
 }
@@ -1337,9 +1341,24 @@ impl UI<'_> {
         match panel {
             CustomPanel::CustomParagraph { ui, body } => {
                 let config = defaultui.extend(&ui);
-                let body = string_to_text(body);
-                let content = Paragraph::new(body).block(block(config, "".into()));
-                f.render_widget(content, layout_size);
+                if let Some(path) = body.strip_prefix("\u{1}xplr-image\u{1}") {
+                    // Image panel: draw the bordered box with an empty interior;
+                    // the runner overlays the real image (iTerm2 protocol) over
+                    // the inner area after this frame is flushed.
+                    self.pending_image = Some((
+                        layout_size.x.saturating_add(1),
+                        layout_size.y.saturating_add(1),
+                        layout_size.width.saturating_sub(2),
+                        layout_size.height.saturating_sub(2),
+                        path.to_string(),
+                    ));
+                    let content = Paragraph::new("").block(block(config, "".into()));
+                    f.render_widget(content, layout_size);
+                } else {
+                    let body = string_to_text(body);
+                    let content = Paragraph::new(body).block(block(config, "".into()));
+                    f.render_widget(content, layout_size);
+                }
             }
 
             CustomPanel::CustomList { ui, body } => {
@@ -1478,6 +1497,7 @@ impl UI<'_> {
     }
 
     pub fn draw(&mut self, f: &mut Frame, app: &app::App) {
+        self.pending_image = None;
         self.screen_size = f.area();
         let layout = app.mode.layout.as_ref().unwrap_or(&app.layout).clone();
         self.draw_layout(layout, f, self.screen_size, app);
