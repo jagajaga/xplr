@@ -41,6 +41,12 @@ e.g.
 
 ### Instructions
 
+#### [v1.1.0][52] -> [v2.0.0][53]
+
+- jagajaga's fork. No config API changes from `1.1.0`; the major bump marks the
+  fork's engine additions (event-driven UI, in-panel iTerm2 image previews) and
+  the multilevel `/` jump. Set `version = "2.0.0"` in your config file.
+
 #### [v1.0.0][51] -> [v1.1.0][52]
 
 - No breaking changes.
@@ -556,3 +562,4 @@ Else do the following:
 [50]: https://github.com/lotabout/skim#search-syntax
 [51]: https://github.com/sayanarijit/xplr/releases/tag/v1.0.0
 [52]: https://github.com/sayanarijit/xplr/releases/tag/v1.1.0
+[53]: https://github.com/jagajaga/xplr/releases/tag/v2.0.0
