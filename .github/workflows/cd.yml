@@ -1,9 +1,10 @@
 name: Continuous Deployment
 
+# Upstream xplr's release pipeline. It GPG-signs artifacts and publishes to
+# crates.io, which needs secrets this fork doesn't have (GPG_SECRET, GPG_PASS,
+# CARGO_API_KEY). Disabled here (manual-only) so it doesn't fail on every tag —
+# this fork's releases are built by release.yml instead.
 on:
-  push:
-    tags:
-      - "v*.*.*"
   workflow_dispatch:
 
 jobs:
