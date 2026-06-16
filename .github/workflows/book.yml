@@ -1,11 +1,10 @@
 name: Book
 
+# Upstream's docs-site deploy to the gh-pages branch (xplr.dev). On this fork
+# the default GITHUB_TOKEN is read-only, so the push to gh-pages is denied
+# (403). The fork doesn't host the docs site, so this is disabled (manual-only)
+# to stop it failing whenever docs/** changes.
 on:
-  push:
-    branches:
-      - main
-    paths:
-      - 'docs/**'
   workflow_dispatch:
 
 jobs:
