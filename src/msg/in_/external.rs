@@ -1859,6 +1859,9 @@ impl NodeSearcherApplicable {
             ranked_nodes.map(|(n, _)| n).collect()
         } else {
             let mut ranked_nodes = ranked_nodes.collect::<Vec<_>>();
+            // Keep the explicit comparator; the rank key isn't trivially Copy,
+            // so sort_by_key would need a clone. Silence the stylistic lint.
+            #[allow(clippy::unnecessary_sort_by)]
             ranked_nodes.sort_by(|(_, s1), (_, s2)| s1.cmp(s2));
             ranked_nodes.into_iter().map(|(n, _)| n).collect()
         }

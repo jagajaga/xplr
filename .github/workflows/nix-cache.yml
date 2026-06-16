@@ -1,7 +1,10 @@
 name: "Push Binary Cache for Nix"
+# Upstream's Cachix push. Needs the CACHIX_AUTH_TOKEN secret (absent on this
+# fork) and the Nix installer can't set up networking on fork runners
+# ("cannot set loopback interface flags"). Disabled (manual-only) so it stops
+# failing on every push.
 on:
-  pull_request:
-  push:
+  workflow_dispatch:
 jobs:
   build:
     strategy:
