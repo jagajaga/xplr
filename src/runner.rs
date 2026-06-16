@@ -260,6 +260,22 @@ impl Runner {
         let (tx_msg_in, rx_msg_in) = mpsc::channel();
         let (tx_pwd_watcher, rx_pwd_watcher) = mpsc::channel();
 
+        // Persistent control FIFO + reader thread. Unlike the per-command msg_in
+        // pipe (created/destroyed around each BashExec), this lives for the whole
+        // session, so background processes (e.g. the copy worker) can push
+        // messages that wake the main loop instantly — event-driven, no polling.
+        // Lives directly in the session dir (NOT in pipe/, which cleanup_pipes
+        // rmdir's after every BashExec — a FIFO there would trip ENOTEMPTY).
+        let ctrl_pipe = format!("{}/ctrl_in", &app.session_path);
+        let _ = fs::remove_file(&ctrl_pipe);
+        if let Ok(cpath) = std::ffi::CString::new(ctrl_pipe.clone()) {
+            unsafe {
+                libc::mkfifo(cpath.as_ptr(), 0o600);
+            }
+        }
+        std::env::set_var("XPLR_PIPE_CTRL_IN", &ctrl_pipe);
+        spawn_ctrl_pipe_reader(ctrl_pipe.clone(), tx_msg_in.clone());
+
         app = app.explore_pwd()?;
 
         for file in self.selection {
@@ -313,6 +329,7 @@ impl Runner {
 
         let mut last_focus: Option<app::Node> = None;
         let mut last_pwd = app.pwd.clone();
+        let mut last_image: Option<(u16, u16, u16, u16, String)> = None;
 
         let mut mouse_enabled = app.config.general.enable_mouse;
         if mouse_enabled {
@@ -498,6 +515,86 @@ impl Runner {
 
                                 // UI
                                 terminal.draw(|f| ui.draw(f, &app))?;
+
+                                // Real image preview (iTerm2): overlay the image
+                                // captured during the draw above, centered in the
+                                // preview box with no letterbox (the uncovered area
+                                // stays the panel's blue). Re-emit only on change.
+                                if ui.pending_image != last_image {
+                                    if let Some((x, y, w, h, path)) =
+                                        ui.pending_image.clone()
+                                    {
+                                        // Render to the image's natural cell size
+                                        // (no fixed box -> no black letterbox).
+                                        // Prefer width-constrained; if too tall,
+                                        // constrain by height instead.
+                                        let run = |args: &[&str]| {
+                                            let out = std::process::Command::new("viu")
+                                                .env("TERM_PROGRAM", "iTerm.app")
+                                                .args(args)
+                                                .output()
+                                                .ok()?;
+                                            if !out.status.success()
+                                                || out.stdout.is_empty()
+                                            {
+                                                return None;
+                                            }
+                                            let (iw, ih) =
+                                                parse_iterm_dims(&out.stdout)?;
+                                            Some((out.stdout, iw, ih))
+                                        };
+                                        let ws = w.to_string();
+                                        let hs = h.to_string();
+                                        // Strip the dependent dimension so iTerm2
+                                        // derives it from the image aspect — this
+                                        // removes the black letterbox entirely.
+                                        let img = run(&["-w", &ws, "-s", &path])
+                                            .filter(|(_, _, ih)| *ih <= h)
+                                            .map(|(b, iw, ih)| {
+                                                (strip_arg(&b, b";height="), iw, ih)
+                                            })
+                                            .or_else(|| {
+                                                run(&["-h", &hs, "-s", &path]).map(
+                                                    |(b, iw, ih)| {
+                                                        (
+                                                            strip_arg(&b, b";width="),
+                                                            iw,
+                                                            ih,
+                                                        )
+                                                    },
+                                                )
+                                            });
+
+                                        let backend = terminal.backend_mut();
+                                        // erase the whole box first when replacing
+                                        // a previous image (ghost-proof)
+                                        if last_image.is_some() && w > 0 {
+                                            let blanks = " ".repeat(w as usize);
+                                            for row in 0..h {
+                                                let _ = write!(
+                                                    backend,
+                                                    "\x1b[{};{}H\x1b[48;5;4m{}\x1b[0m",
+                                                    y + 1 + row,
+                                                    x + 1,
+                                                    blanks
+                                                );
+                                            }
+                                        }
+                                        if let Some((bytes, iw, ih)) = img {
+                                            let col_off = w.saturating_sub(iw) / 2;
+                                            let row_off = h.saturating_sub(ih) / 2;
+                                            let _ = write!(
+                                                backend,
+                                                "\x1b[{};{}H",
+                                                y + 1 + row_off,
+                                                x + 1 + col_off
+                                            );
+                                            let _ = backend.write_all(&bytes);
+                                        }
+                                        let _ = backend.flush();
+                                    }
+                                    last_image = ui.pending_image.clone();
+                                }
                             }
 
                             EnableMouse => {
@@ -825,10 +922,83 @@ impl Runner {
         term::disable_raw_mode()?;
         terminal.show_cursor()?;
 
-        fs::remove_dir_all(session_path)?;
+        // Unlink the persistent ctrl FIFO first (the reader thread holds it
+        // open, which otherwise trips remove_dir_all with ENOTEMPTY), then
+        // clean the session dir best-effort.
+        let _ = fs::remove_file(&ctrl_pipe);
+        let _ = fs::remove_dir_all(session_path);
 
         result
     }
+}
+
+/// Remove a `;key=value` argument (e.g. b";height=") from a viu iTerm2 escape so
+/// iTerm2 derives that dimension from the image aspect (no black letterbox).
+fn strip_arg(escape: &[u8], key: &[u8]) -> Vec<u8> {
+    if let Some(start) = escape.windows(key.len()).position(|w| w == key) {
+        let mut end = start + key.len();
+        while end < escape.len() && escape[end] != b';' && escape[end] != b':' {
+            end += 1;
+        }
+        let mut out = Vec::with_capacity(escape.len() - (end - start));
+        out.extend_from_slice(&escape[..start]);
+        out.extend_from_slice(&escape[end..]);
+        out
+    } else {
+        escape.to_vec()
+    }
+}
+
+/// Parse the cell `width=`/`height=` from a viu-generated iTerm2 inline-image
+/// escape (the args before the `:` base64 payload).
+fn parse_iterm_dims(escape: &[u8]) -> Option<(u16, u16)> {
+    let colon = escape.iter().position(|&b| b == b':')?;
+    let head = std::str::from_utf8(&escape[..colon]).ok()?;
+    let field = |key: &str| -> Option<u16> {
+        head.split(key)
+            .nth(1)?
+            .split([';', ':'])
+            .next()?
+            .trim()
+            .parse()
+            .ok()
+    };
+    Some((field("width=")?, field("height=")?))
+}
+
+/// Reads the persistent control FIFO and forwards each message into the main
+/// event channel. The FIFO is opened read+write so the reader never sees EOF
+/// between writers; it blocks on read (no polling) and wakes the main loop the
+/// instant a background process writes a message.
+fn spawn_ctrl_pipe_reader(ctrl_pipe: String, tx: mpsc::Sender<app::Task>) {
+    use std::fs::OpenOptions;
+    use std::io::{BufRead, BufReader};
+
+    std::thread::spawn(move || loop {
+        let file = match OpenOptions::new().read(true).write(true).open(&ctrl_pipe) {
+            Ok(f) => f,
+            Err(_) => return, // FIFO gone (session ended)
+        };
+        let reader = BufReader::new(file);
+        for line in reader.lines() {
+            let line = match line {
+                Ok(l) => l,
+                Err(_) => break, // reopen
+            };
+            let line = line.trim();
+            if line.is_empty() {
+                continue;
+            }
+            if let Ok(msg) = yaml::from_str::<ExternalMsg>(line) {
+                if tx
+                    .send(app::Task::new(app::MsgIn::External(msg), None))
+                    .is_err()
+                {
+                    return; // main loop gone
+                }
+            }
+        }
+    });
 }
 
 /// Create a new runner object passing the default arguments
