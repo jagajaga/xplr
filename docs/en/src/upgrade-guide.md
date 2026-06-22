@@ -41,6 +41,11 @@ e.g.
 
 ### Instructions
 
+#### [v2.0.0][53] -> [v2.0.1][54]
+
+- No breaking changes; config written for `2.0.0` works as-is. Async, cancellable
+  `/` jump and start-dir file matches (config-side).
+
 #### [v1.1.0][52] -> [v2.0.0][53]
 
 - jagajaga's fork. No config API changes from `1.1.0`; the major bump marks the
@@ -563,3 +568,4 @@ Else do the following:
 [51]: https://github.com/sayanarijit/xplr/releases/tag/v1.0.0
 [52]: https://github.com/sayanarijit/xplr/releases/tag/v1.1.0
 [53]: https://github.com/jagajaga/xplr/releases/tag/v2.0.0
+[54]: https://github.com/jagajaga/xplr/releases/tag/v2.0.1

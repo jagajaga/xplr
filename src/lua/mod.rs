@@ -152,6 +152,9 @@ mod tests {
         assert!(check_version(VERSION, "foo path").is_ok());
 
         // Current release is OK
+        assert!(check_version("2.0.1", "foo path").is_ok());
+
+        // Earlier patch on the same minor is OK (app bugfix >= config bugfix)
         assert!(check_version("2.0.0", "foo path").is_ok());
 
         // Prev major releases are ERR
@@ -166,6 +169,6 @@ mod tests {
         assert!(check_version("2.1.0", "foo path").is_err());
 
         // Next bugfix release is ERR
-        assert!(check_version("2.0.1", "foo path").is_err());
+        assert!(check_version("2.0.2", "foo path").is_err());
     }
 }

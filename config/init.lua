@@ -56,21 +56,54 @@ xplr.config.modes.builtin.default.key_bindings.on_key.enter = {
   messages = { "Enter" },
 }
 
--- --- `/` : zsh-style multilevel completion, IN-PANE (cross-folder) ---------
+-- --- `/` : zsh-style multilevel completion, IN-PANE (cross-folder), ASYNC ----
 -- Press `/`, then type a path. Every `/`-separated segment is a case-insensitive
--- prefix; the shell globs the whole pattern and the pane shows EVERY match
--- across folders at once — e.g. p/w lists projects∕web-app, projects∕worker,
--- public∕wiki together (a flat menu, like zsh completion). It does this by
--- filling a temp folder with shortcuts to the matches. up/down pick; Enter goes
--- to the highlighted match (following the shortcut); Esc returns to start.
--- `ctrl-f` is still xplr's plain fuzzy search.
+-- prefix; the pane shows EVERY match across folders at once — e.g. p/w lists
+-- projects∕web-app, projects∕worker, public∕wiki together (a flat menu, like zsh
+-- completion). It does this by filling a temp folder with shortcuts. The globbing
+-- runs in a DETACHED background worker so typing never blocks (even on `*`); the
+-- pane is refreshed when the worker finishes via the fork's control FIFO, and
+-- only the latest keystroke's result is applied. up/down pick; Enter follows the
+-- highlighted shortcut; Esc returns to start. `ctrl-f` is xplr's plain search.
 local jump_start_pwd = nil
 local JUMP_RESULTS = "/tmp/xplr-jump-results"
+local JUMP_WANTED = "/tmp/xplr-jump-wanted" -- latest keystroke's input (backstop)
+local JUMP_PID = "/tmp/xplr-jump-pid"       -- PID of the live worker (to cancel)
+local JUMP_WORKER = "/tmp/xplr-jump-worker.sh"
+local JUMP_SENTINEL = "\1" -- written to WANTED on exit so in-flight workers skip
 
--- Globs the whole pattern from the start dir and symlinks every match (named by
--- its path relative to the start, with "/" shown as "∕") into a results folder.
-local JUMP_SCRIPT = [==[
-expr="$1"; base="$2"; results="$3"
+local function write_file(path, content)
+  local f = io.open(path, "w")
+  if f then
+    f:write(content)
+    f:close()
+  end
+end
+
+-- Cancel the live worker (and its glob children). Each keystroke does this
+-- before launching a new one, so a slow glob never blocks the next search.
+local function kill_worker()
+  xplr.util.shell_execute("bash", {
+    "-c",
+    "p=$(cat '" .. JUMP_PID .. "' 2>/dev/null); [ -n \"$p\" ] && { pkill -P \"$p\" 2>/dev/null; kill -9 \"$p\" 2>/dev/null; }; :",
+  })
+end
+
+-- Detached background worker. After a short debounce it builds the results
+-- folder of shortcuts, then pokes xplr's control FIFO to refresh the pane. No
+-- lock is needed: the launcher KILLS the previous worker before starting this
+-- one, so only a single worker is ever alive. Directory matches are cross-folder
+-- at any depth; file matches are limited to files directly in the start dir.
+local JUMP_WORKER_BODY = [==[
+myinput="$1"; base="$2"; results="$3"; ctrl="$4"
+wanted="/tmp/xplr-jump-wanted"
+mine() { [ "$(cat "$wanted" 2>/dev/null)" = "$myinput" ]; }
+
+# A newer keystroke kills this process (see launcher), so a burst of typing
+# terminates us here, before we ever touch the disk.
+sleep 0.05
+
+expr="$myinput"
 case "$expr" in
   "~/"*) cur="$HOME"; rest="${expr#\~/}" ;;
   "~")   cur="$HOME"; rest="" ;;
@@ -79,51 +112,89 @@ case "$expr" in
 esac
 while [ "${rest%/}" != "$rest" ]; do rest="${rest%/}"; done
 shopt -s nocaseglob nullglob
-pat=""; IFS='/' read -ra segs <<< "$rest"
+pat=""; first=""; IFS='/' read -ra segs <<< "$rest"
 for seg in "${segs[@]}"; do
   [ -z "$seg" ] && continue
+  [ -z "$first" ] && first="$seg" # first segment = the start-dir (current) level
   pat="${pat}${seg}*/" # trailing / => directories only (it's a folder jump)
 done
-if [ -z "$pat" ]; then printf '%s\n' "$cur"; exit 0; fi
-# Keep the results dir itself (xplr may be standing in it) — only clear its
-# contents, so xplr's cwd inode never disappears mid-keystroke.
-mkdir -p "$results"; find "$results" -mindepth 1 -delete 2>/dev/null
-count=0
-for m in "$cur"/$pat; do
-  m="${m%/}"
-  rel="${m#"$cur"/}"
-  name="${rel//\//∕}"
-  ln -s "$m" "$results/$name" 2>/dev/null
-  count=$((count+1)); [ "$count" -ge 2000 ] && break
-done
-printf '%s\n' "$results"
+
+target="$results"
+if [ -z "$pat" ]; then
+  target="$cur"                  # empty input -> just show the start dir
+else
+  # Keep the results dir itself (xplr may be standing in it) — only clear its
+  # contents, so xplr's cwd inode never disappears mid-keystroke.
+  mkdir -p "$results"; find "$results" -mindepth 1 -delete 2>/dev/null
+  count=0
+  for m in "$cur"/$pat; do
+    m="${m%/}"
+    rel="${m#"$cur"/}"
+    name="${rel//\//∕}"
+    ln -s "$m" "$results/$name" 2>/dev/null
+    count=$((count+1)); [ "$count" -ge 2000 ] && break
+  done
+  # Also surface FILES directly in the start dir matching the first segment.
+  for m in "$cur"/${first}*; do
+    [ -f "$m" ] || continue
+    name="${m##*/}"; [ -e "$results/$name" ] && continue
+    ln -s "$m" "$results/$name" 2>/dev/null
+    count=$((count+1)); [ "$count" -ge 2000 ] && break
+  done
+fi
+
+mine || exit 0                   # superseded during the glob -> don't touch view
+[ -n "$ctrl" ] && [ -p "$ctrl" ] || exit 0
+esc=$(printf '%s' "$target" | sed 's/\\/\\\\/g; s/"/\\"/g')
+{
+  printf 'ChangeDirectory: "%s"\n' "$esc"
+  printf 'ExplorePwd\n'
+  printf 'FocusFirst\n'
+} > "$ctrl"
+]==]
+
+-- Instant launcher (synchronous, but it only CANCELS the previous worker and
+-- backgrounds a new one, then returns). Args: $1=worker $2=input $3=base
+-- $4=results $5=ctrl $6=pidfile.
+local JUMP_LAUNCH = [==[
+worker="$1"; input="$2"; base="$3"; results="$4"; ctrl="$5"; pidf="$6"
+prev=$(cat "$pidf" 2>/dev/null)
+if [ -n "$prev" ]; then pkill -P "$prev" 2>/dev/null; kill -9 "$prev" 2>/dev/null; fi
+nohup bash "$worker" "$input" "$base" "$results" "$ctrl" </dev/null >/dev/null 2>&1 &
+echo $! > "$pidf"
 ]==]
 
 xplr.fn.custom.jump_start = function(app)
   jump_start_pwd = app.pwd
+  write_file(JUMP_WORKER, JUMP_WORKER_BODY) -- (re)materialize the worker script
+  write_file(JUMP_WANTED, JUMP_SENTINEL)    -- invalidate any leftover worker
+  kill_worker()                             -- cancel a worker left over from before
+  xplr.util.shell_execute("bash", { "-c", "mkdir -p '" .. JUMP_RESULTS .. "'" })
   return {}
 end
 
+-- Each keystroke: record the input, KILL the previous worker, and fire a new one
+-- DETACHED, then return immediately. No globbing happens on the xplr thread, so
+-- typing never blocks (even on `*`) and the now-stale search is aborted at once;
+-- the pane is refreshed later by the worker via the control FIFO.
 xplr.fn.custom.jump_live = function(app)
+  local input = app.input_buffer or ""
   local base = jump_start_pwd or app.pwd
-  local out = xplr.util.shell_execute("bash", { "-c", JUMP_SCRIPT, "_", app.input_buffer or "", base, JUMP_RESULTS })
-  local dir = (out and out.stdout or ""):gsub("%s+$", "")
-  if dir == "" then
-    return {}
-  end
-  local msgs = {}
-  if dir ~= app.pwd then
-    table.insert(msgs, { ChangeDirectory = dir })
-  end
-  table.insert(msgs, "ExplorePwd")
-  table.insert(msgs, "FocusFirst")
-  return msgs
+  local ctrl = os.getenv("XPLR_PIPE_CTRL_IN") or ""
+  write_file(JUMP_WANTED, input) -- latest keystroke wins (poke backstop)
+  xplr.util.shell_execute(
+    "bash",
+    { "-c", JUMP_LAUNCH, "_", JUMP_WORKER, input, base, JUMP_RESULTS, ctrl, JUMP_PID }
+  )
+  return {}
 end
 
 -- Enter: resolve the highlighted shortcut to its REAL path (realpath follows
 -- the whole chain, e.g. a cloud-synced symlink) and go there, so pwd is the
 -- real folder rather than the temp shortcut.
 xplr.fn.custom.jump_commit = function(app)
+  write_file(JUMP_WANTED, JUMP_SENTINEL) -- backstop: stop any in-flight worker poking
+  kill_worker() -- and actually cancel it
   local node = app.focused_node
   if not node then
     if jump_start_pwd then
@@ -148,6 +219,8 @@ xplr.fn.custom.jump_commit = function(app)
 end
 
 xplr.fn.custom.jump_cancel = function(app)
+  write_file(JUMP_WANTED, JUMP_SENTINEL) -- backstop: stop any in-flight worker poking
+  kill_worker() -- and actually cancel it
   if jump_start_pwd then
     return { { ChangeDirectory = jump_start_pwd } }
   end
